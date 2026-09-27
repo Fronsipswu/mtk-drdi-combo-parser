@@ -56,7 +56,7 @@ from mtk_export import write_b0cd_v41
 from mtk_tensor_secondary import decode_tensor_secondary
 from mtk_trace import write_trace
 
-VERSION = "0.2-universal"
+VERSION = "0.4-universal"
 
 U32 = struct.Struct("<I")
 D16 = struct.Struct("<IIII")
@@ -93,6 +93,8 @@ LTE_UL_ABSENT = 6
 NR_UL_ABSENT_CANON = 0x1C    # value the shared exporter expects; see RomTables.nr_ul_absent
 VA_LO = 0x60000000           # DRDI runtime address window (all solved devices)
 VA_HI = 0x80000000
+SUPPORTED_BAND_SLOTS = 40
+SUPPORTED_BAND_PAD = 0xFFFD
 
 
 class UniversalError(RuntimeError):
@@ -432,6 +434,146 @@ class BaseLoader:
         family stores a pointer array of row objects.
         """
         return choose_lte_bank(self, cap, rep)
+
+
+def discover_supported_band_list(loader: BaseLoader, bank: Optional[Bank],
+                                 rat: str, rep: Reporter) -> dict:
+    """Recover a firmware-authentic standalone supported-band list.
+
+    Modern DRDI profiles carry a fixed 40-entry u16 table: a strictly
+    increasing prefix of 3GPP band numbers followed by 0xfffd padding.  This
+    is a different namespace from CA/EN-DC CandidateNodes.  A band can be
+    supported for standalone operation without appearing in any stored CA
+    row, so it must be reported separately rather than fabricated into an
+    ``A``-class combination.
+
+    Shape alone is not accepted.  The table's runtime address must also be
+    referenced by an aligned word in md1rom, independently proving that the
+    data is an initialized firmware object rather than a coincidental sorted
+    sequence.  The bank role supplies the RAT: Bank 5-style LTE and Bank
+    6-style NR tables use the same framing.
+    """
+    if bank is None or not bank.images:
+        return {}
+    rat = rat.upper()
+    max_band = MAX_LTE_BAND if rat == "LTE" else 1024
+    slot_bytes = 2 * SUPPORTED_BAND_SLOTS
+    if np is not None:
+        words = np.frombuffer(loader.rom, dtype="<u4", count=len(loader.rom) // 4)
+    else:
+        words = None
+    profiles = {}
+    for im in bank.images:
+        lo = im.bank_va + im.alias
+        hi = lo + im.length
+        if words is not None:
+            ptr_values = sorted(set(int(words[i]) for i in np.flatnonzero(
+                (words >= lo) & (words + slot_bytes <= hi))))
+        else:
+            ptr_values = sorted(set(
+                u32(loader.rom, o) for o in range(0, len(loader.rom) - 3, 4)
+                if lo <= u32(loader.rom, o) and u32(loader.rom, o) + slot_bytes <= hi))
+        candidates = []
+        for va in ptr_values:
+            off = im.resolve(va, slot_bytes)
+            if off is None:
+                continue
+            vals = struct.unpack_from("<40H", im.drdi, off)
+            try:
+                used = vals.index(SUPPORTED_BAND_PAD)
+            except ValueError:
+                continue
+            bands = vals[:used]
+            if not (8 <= len(bands) < SUPPORTED_BAND_SLOTS):
+                continue
+            if (any(not (1 <= b <= max_band) for b in bands)
+                    or any(a >= b for a, b in zip(bands, bands[1:]))
+                    or any(v != SUPPORTED_BAND_PAD for v in vals[used:])):
+                continue
+            refs = tuple(find_all(loader.rom, struct.pack("<I", va)))
+            candidates.append((off, va, tuple(bands), refs))
+        # Duplicate ROM references to the same object collapse above.  More
+        # than one differently-valued object would make the role ambiguous;
+        # report it instead of silently selecting a convenient table.
+        distinct = {c[2] for c in candidates}
+        if len(distinct) > 1:
+            rep.warn("supported_band_list_ambiguous",
+                     "multiple differently-valued ROM-referenced supported-band lists in one profile",
+                     rat=rat, bank_index=bank.table_index, profile=im.profile,
+                     candidates=len(candidates))
+            continue
+        if candidates:
+            off, va, bands, refs = min(candidates, key=lambda c: c[0])
+            profiles[str(im.profile)] = {
+                "bands": list(bands),
+                "relative_off": hex(off - im.source_offset),
+                "runtime_va": hex(va),
+                "rom_pointer_refs": [hex(x) for x in refs],
+            }
+            rep.info("supported_band_list",
+                     "recovered ROM-referenced standalone supported-band list",
+                     rat=rat, bank_index=bank.table_index, profile=im.profile,
+                     relative_off=hex(off - im.source_offset), bands=list(bands),
+                     rom_pointer_refs=[hex(x) for x in refs])
+    if not profiles:
+        return {}
+    sets = [set(v["bands"]) for v in profiles.values()]
+    union = sorted(set().union(*sets))
+    intersection = sorted(set.intersection(*sets))
+    return {"rat": rat, "bank_index": bank.table_index,
+            "bank_va": hex(bank.bank_va), "profiles": profiles,
+            "union": union, "intersection": intersection,
+            "profiles_consistent": all(s == sets[0] for s in sets[1:])}
+
+
+def discover_supported_bands(loader: BaseLoader, cap: Bank,
+                             lte_bank: Optional[Bank], rep: Reporter) -> dict:
+    """Return standalone LTE/NR support separately from combination rows."""
+    out = {}
+    lte = discover_supported_band_list(loader, lte_bank, "LTE", rep)
+    nr = discover_supported_band_list(loader, cap, "NR", rep)
+    if lte:
+        out["lte"] = lte
+    if nr:
+        out["nr"] = nr
+    return out
+
+
+def annotate_band_participation(support: dict, capability_combos,
+                                lte_combos) -> dict:
+    """Add combination participation without treating support as a combo."""
+    if "lte" in support:
+        participating = sorted({c.band for row in lte_combos for c in row.lte})
+        supported = set(support["lte"]["union"])
+        support["lte"]["combination_participating"] = participating
+        support["lte"]["supported_without_lte_ca_row"] = sorted(supported - set(participating))
+    if "nr" in support:
+        participating = sorted({c.band for row in capability_combos for c in row.nr})
+        supported = set(support["nr"]["union"])
+        support["nr"]["combination_participating"] = participating
+        support["nr"]["supported_without_nr_combination_row"] = sorted(supported - set(participating))
+    return support
+
+
+def write_supported_bands(support: dict, out_dir: Path, stem: str) -> Optional[Path]:
+    """Write a human-readable supported-band inventory when one is proved."""
+    if not support:
+        return None
+    lines = ["# Firmware-supported bands; these are not synthetic CA combinations."]
+    for key, label, missing_key in (
+            ("lte", "LTE", "supported_without_lte_ca_row"),
+            ("nr", "NR", "supported_without_nr_combination_row")):
+        item = support.get(key)
+        if not item:
+            continue
+        lines.append(f"{label}_SUPPORTED_BANDS=" + ",".join(map(str, item["union"])))
+        lines.append(f"{label}_COMBINATION_PARTICIPATING_BANDS="
+                     + ",".join(map(str, item.get("combination_participating", ()))))
+        lines.append(f"{label}_SUPPORTED_WITHOUT_COMBINATION_ROW="
+                     + ",".join(map(str, item.get(missing_key, ()))))
+    path = out_dir / f"{stem}_supported_bands.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 class GridLoader(BaseLoader):
@@ -1564,10 +1706,10 @@ def dedup_exact(combos: Iterable[export.Combo]) -> list[export.Combo]:
     return out
 
 
-# LTE 32-byte rows
+# LTE row tables
 @dataclass
 class LteRow:
-    off:int; combo:export.Combo
+    off:int; combo:export.Combo; layout:str = "legacy32"
 
 
 def parse_lte_fields(im: Image, c0_off: int, tables: RomTables) -> Optional[export.Combo]:
@@ -1614,46 +1756,108 @@ def parse_lte_row(im: Image, off: int, tables: RomTables) -> Optional[LteRow]:
     return None if cb is None else LteRow(off, cb)
 
 
+def parse_lte_row36(im: Image, off: int, tables: RomTables) -> Optional[LteRow]:
+    """Extended contiguous LTE row used by newer grid firmware.
+
+    The row is nine u32s::
+
+      word0, flags, selector, component_count, component_ptr,
+      mimo_count, dl_mimo_ptr, companion_mimo_ptr, component_count_copy
+
+    ``word0`` is a table/object link (the first row can instead contain an
+    initializer), while ``selector`` and the companion MIMO vector are not
+    needed for the LTE CA projection.  They are nevertheless useful proof:
+    both component counts must agree and both MIMO vectors must be in-range
+    and use the same validated status alphabet.  This keeps the scanner from
+    accepting a plausible-looking six-field window inside unrelated data.
+    """
+    if off < im.source_offset or off + 36 > im.end_source:
+        return None
+    _word0, flags, _selector, c0, p0, c1, p1, p2, c2 = struct.unpack_from(
+        "<9I", im.drdi, off)
+    if (flags >> 16) != 0xFFFF or not (1 <= c0 <= 16) or c2 != c0:
+        return None
+    ro = im.resolve(p0, c0 * 3)
+    mo = im.resolve(p1, c1)
+    companion = im.resolve(p2, c1)
+    if ro is None or mo is None or companion is None or c1 <= 0:
+        return None
+
+    recs=[]; units=0
+    for k in range(c0):
+        idx,ul,dl=struct.unpack_from("<BBB",im.drdi,ro+3*k)
+        if idx>=len(tables.lte_band_map): return None
+        band=tables.lte_band_map[idx]
+        if band == 0 or band > MAX_LTE_BAND or dl >= 6 or (ul != LTE_UL_ABSENT and ul >= 6):
+            return None
+        units+=tables.lte_weights[dl]; recs.append((band,ul,dl))
+    if c1 != units:
+        return None
+    mmraw=list(im.drdi[mo:mo+c1])
+    companion_raw=im.drdi[companion:companion+c1]
+    if (any(x not in (2,3,4) for x in mmraw)
+            or any(x not in (2,3,4) for x in companion_raw)):
+        return None
+
+    mmap={2:2,3:4,4:8}; cur=0; comps=[]
+    for band,ul,dl in recs:
+        n=tables.lte_weights[dl]; sl=mmraw[cur:cur+n]; cur+=n
+        comps.append(export.LteComponent(band,dl,ul,[mmap[x] for x in sl]))
+    if cur != c1:
+        return None
+    return LteRow(off, export.Combo(comps,[]), "extended36")
+
+
 def scan_lte_rows_bank(bank:Bank,tables:RomTables,rep:Reporter) -> dict[int,list[export.Combo]]:
-    """Find 32-byte LTE row tables in every live image by 100% invariant runs."""
+    """Find supported contiguous LTE row tables by 100% invariant runs.
+
+    Older grid/CDF images use 32-byte rows.  Newer grid images use the
+    extended 36-byte layout decoded above.  Layout selection is structural:
+    scan every four-byte phase for each stride and retain the longest fully
+    valid run, rather than keying the choice to a device or chipset name.
+    """
     result={}
     for im in bank.images:
-        valids=[]
-        # Rows are 32-byte aligned relative to the source image in solved modern layouts.
-        # Scan each residue modulo 32 because source offsets need not themselves be aligned.
         best=[]
-        for residue in range(0,32,4):
-            rows=[]; cur=[]
-            start=im.source_offset+((residue-im.source_offset)%32)
-            offsets = range(start, im.end_source - 31, 32)
-            if np is not None and offsets:
-                # This is exactly parse_lte_fields' first count check, not a
-                # new signature. Keep every possible row for full validation.
-                counts = np.ndarray((len(offsets),), dtype="<u4", buffer=im.drdi,
-                                    offset=start + 8, strides=(32,))
-                offsets = (start + int(i) * 32
-                           for i in np.flatnonzero((counts >= 1) & (counts <= 16)))
-            previous = None
-            for off in offsets:
-                # Skipped impossible rows still terminate invariant runs.
-                if previous is not None and off != previous + 32:
-                    if len(cur)>=4: rows.append(cur)
-                    cur=[]
-                previous = off
-                r=parse_lte_row(im,off,tables)
-                if r:
-                    cur.append(r)
-                else:
-                    if len(cur)>=4: rows.append(cur)
-                    cur=[]
-            if len(cur)>=4: rows.append(cur)
-            if rows:
-                m=max(rows,key=len)
-                if len(m)>len(best): best=m
+        for stride, count_delta, parser in (
+                (32, 8, parse_lte_row), (36, 12, parse_lte_row36)):
+            # Source offsets need not be stride-aligned, so cover every
+            # four-byte phase relative to the complete DRDI image.
+            for residue in range(0,stride,4):
+                rows=[]; cur=[]
+                start=im.source_offset+((residue-im.source_offset)%stride)
+                offsets = range(start, im.end_source - stride + 1, stride)
+                if np is not None and offsets:
+                    # The count is only a prefilter. Full acceptance remains
+                    # the parser's pointer and semantic invariant proof.
+                    counts = np.ndarray((len(offsets),), dtype="<u4", buffer=im.drdi,
+                                        offset=start + count_delta, strides=(stride,))
+                    offsets = (start + int(i) * stride
+                               for i in np.flatnonzero((counts >= 1) & (counts <= 16)))
+                previous = None
+                for off in offsets:
+                    # Skipped impossible rows still terminate invariant runs.
+                    if previous is not None and off != previous + stride:
+                        if len(cur)>=4: rows.append(cur)
+                        cur=[]
+                    previous = off
+                    r=parser(im,off,tables)
+                    if r:
+                        cur.append(r)
+                    else:
+                        if len(cur)>=4: rows.append(cur)
+                        cur=[]
+                if len(cur)>=4: rows.append(cur)
+                if rows:
+                    m=max(rows,key=len)
+                    if len(m)>len(best): best=m
         if best:
             result[im.profile]=[r.combo for r in best]
             rep.info("lte_row_table","found invariant-valid LTE CA row table",
-                     bank_va=hex(bank.bank_va),profile=im.profile,relative_off=hex(best[0].off-im.source_offset),rows=len(best))
+                     bank_va=hex(bank.bank_va),profile=im.profile,
+                     relative_off=hex(best[0].off-im.source_offset),rows=len(best),
+                     row_layout=best[0].layout,
+                     row_stride=36 if best[0].layout == "extended36" else 32)
     return result
 
 
@@ -1994,6 +2198,11 @@ def run_secondary_extraction(loader: BaseLoader, args, rep: Reporter) -> dict:
     meta = export_selected_formats(combos, lte_for_selection, args.device, args.out,
                                    args.stem, selected_formats,
                                    exclude_subsets=getattr(args, "exclude_mimo_subsets", False))
+    supported_bands = annotate_band_participation(
+        discover_supported_bands(loader, cap, lte_bank, rep), combos, lte_union)
+    supported_path = write_supported_bands(supported_bands, args.out, args.stem)
+    if supported_path is not None:
+        meta["files"][supported_path.name] = str(supported_path)
     summaries = []
     for item in wanted:
         item_combos = _secondary_combos(item)
@@ -2023,7 +2232,8 @@ def run_secondary_extraction(loader: BaseLoader, args, rep: Reporter) -> dict:
             "lte_bank_index": lte_bank.table_index if lte_bank else None,
             "lte_profiles": {str(k): len(v) for k, v in lte_profiles.items()},
             "lte_union_exact_rows": len(lte_for_selection),
-            "lte_union_all_profiles_exact_rows": len(lte_union), "export": meta}
+            "lte_union_all_profiles_exact_rows": len(lte_union),
+            "supported_bands": supported_bands, "export": meta}
 
 
 def run_extraction(loader: BaseLoader, args, rep: Reporter) -> dict:
@@ -2044,6 +2254,11 @@ def run_extraction(loader: BaseLoader, args, rep: Reporter) -> dict:
     meta = export_selected_formats(union, lte_union, args.device, args.out,
                                    args.stem, selected_formats,
                                    exclude_subsets=getattr(args, "exclude_mimo_subsets", False))
+    supported_bands = annotate_band_participation(
+        discover_supported_bands(loader, cap, lte_bank, rep), union, lte_union)
+    supported_path = write_supported_bands(supported_bands, args.out, args.stem)
+    if supported_path is not None:
+        meta["files"][supported_path.name] = str(supported_path)
     detail = {
         "loader": loader.name,
         "rom_tables": loader.tables.as_dict(),
@@ -2061,6 +2276,7 @@ def run_extraction(loader: BaseLoader, args, rep: Reporter) -> dict:
         "lte_bank_index": lte_bank.table_index if lte_bank else None,
         "lte_profiles": {str(k): len(v) for k, v in lte_profiles.items()},
         "lte_union_exact_rows": len(lte_union),
+        "supported_bands": supported_bands,
         "export": meta,
     }
     if isinstance(loader, FlatLoader):

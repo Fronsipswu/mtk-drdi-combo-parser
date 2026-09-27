@@ -165,6 +165,9 @@ class MtkBackend:
             secondary_profiles = UNIVERSAL.tensor_secondary_summaries(
                 active, "all", reporter, lte_profiles=lte_profiles,
                 lte_count=len(lte_union))
+            supported_bands = UNIVERSAL.annotate_band_participation(
+                UNIVERSAL.discover_supported_bands(active, cap, lte_bank, reporter),
+                union, lte_union)
         except Exception as exc:
             raise BackendError(str(exc)) from exc
         return {
@@ -176,6 +179,7 @@ class MtkBackend:
             "lte_bank": hex(lte_bank.bank_va) if lte_bank else None,
             "lte_bank_index": lte_bank.table_index if lte_bank else None,
             "lte_profiles": {str(key): len(value) for key, value in lte_profiles.items()},
+            "supported_bands": supported_bands,
             "union": {"exact_rows": len(union),
                       "kinds": dict(zip(("endc", "nrca", "lte"),
                                          map(len, UNIVERSAL.export.classify(union, 1)))),
@@ -430,6 +434,20 @@ def format_profile_topology(report: dict) -> str:
         for bank, profiles in report["physical_lte_profiles"].items():
             for profile, count in profiles.items():
                 lines.append(f"  bank {bank} / profile {profile}: {count} LTE rows")
+    support = report.get("supported_bands", {})
+    if support:
+        lines.extend(("", "Firmware-supported bands (separate from combination rows):"))
+        for key, label, missing_key in (
+                ("lte", "LTE", "supported_without_lte_ca_row"),
+                ("nr", "NR", "supported_without_nr_combination_row")):
+            item = support.get(key)
+            if not item:
+                continue
+            lines.append(f"  {label}: " + ", ".join(map(str, item.get("union", ()))))
+            missing = item.get(missing_key, ())
+            if missing:
+                lines.append(f"    supported without a static combination row: "
+                             + ", ".join(map(str, missing)))
     if not report.get("profiles"):
         lines.append("  No capability profile was decoded.")
     secondary = report.get("secondary_profiles", ())
