@@ -1,11 +1,24 @@
 """NR15 grids, ROM-resident roots, and the older two-byte MIMO grammar.
 
-The MT6833 NR15.R3 consumer uses three-byte NR records, not the modern
+The NR15.R3 consumers use three-byte NR records, not the modern
 u16-band record, and obtains bandwidth from separate per-band ROM tables.
 All offsets below describe structures/instructions, never device file offsets.
 """
 from dataclasses import dataclass
+import itertools
 import struct
+
+import mtk_nr15_bw
+
+# nl1_rfd_cap_fill_in_ca_comb_info chooses the pair-table mode from a hardware
+# register and SBP feature 0x4E. Neither is static, so the projection fixes the
+# 120-MHz branch (inter-band 4, intra-band 3): hardware state <=1 with SBP
+# 0x4E in {0x0C, 0x0D, 0x14}. Redmi Note 12 Pro trace capture matches it exactly;
+# the SBP default branch would select the 100-MHz modes 6/5 instead.
+BW_MODE_INTER, BW_MODE_INTRA = 4, 3
+# nl1_cap_arrange_by_sim_type: 15 kHz carriers are capped at enum 7 (50 MHz),
+# and an SCS variant survives only if sum(DL MHz * 30/SCS) <= 160.
+SCS15_MAX_CODE, DL_SCS_BUDGET = 7, 160
 
 
 @dataclass(frozen=True)
@@ -111,45 +124,157 @@ class Nr15Decoder:
         for bank in loader.banks:
             if not bank.images:
                 continue
-            arrays = []
+            options = {}
             for im in bank.images:
                 found = self.complete_arrays(im, self.candidate)
-                if len(found) != 1:
+                if not found:
                     break
-                arrays.append(found[0])
-            if len(arrays) == len(bank.images):
-                choices.append((bank, arrays))
+                options[im.profile] = dict(found)
+            if len(options) == len(bank.images):
+                for root, arrays in self.profile_tables(bank.images, options):
+                    choices.append((bank, root, arrays))
         if len(choices) != 1:
-            raise api.UniversalError("NR15: expected one bank with one complete candidate array per profile")
-        self.cap, arrays = choices[0]
+            raise api.UniversalError("NR15: expected one complete, firmware-corroborated profile root table")
+        self.cap, self.profile_table, arrays = choices[0]
+        self.profile_count = len(self.cap.images)
         for im, array in zip(self.cap.images, arrays):
             self.arrays[im.profile] = array
-        self.profile_table = self.find_profile_table(arrays)
-        if self.profile_table is None:
-            raise api.UniversalError("NR15: candidate arrays are not corroborated by a ROM profile root table")
         self.band_limits = {}
         for im in self.cap.images:
-            # Code-proven root-block relationship: per-band BB bandwidth
-            # roots precede the MRDC candidate roots by 0x24 bytes.
-            ptr = api.u32(self.rom, self.profile_table - 0x24 + 4 * im.profile)
+            # Three equal-length profile-root groups precede the primary
+            # roots; the span is profile-count dependent, not fixed at 0x24.
+            ptr = api.u32(self.rom, self.profile_table - 3*self.profile_count*4 + 4*im.profile)
             off = self.resolve_rom(ptr, 2)
             limits = None if off is None else band_bw_pairs(self.rom, off, len(loader.tables.bw))
             if limits is None:
                 raise api.UniversalError("NR15: invalid profile-specific per-band bandwidth root")
             self.band_limits[im.profile] = limits
-        # The RF bandwidth list immediately follows the indexed enum, its
-        # terminator, and a four-byte RF aggregate limit.
-        off = loader.tables.bw_off + 4 * (len(loader.tables.bw) + 1) + 4
-        self.rf_limits = band_bw_pairs(self.rom, off, len(loader.tables.bw))
-        if self.rf_limits is None:
-            raise api.UniversalError("NR15: missing RF per-band bandwidth table after the indexed enum")
+        self.rf_limits_off, self.rf_limits = self.discover_rf_limits()
+        self.bb_default_off, self.bb_default = self.discover_default_bb()
+        pairs = [o for o in api.find_all(self.rom, mtk_nr15_bw.table_signature())]
+        self.pair_table_off = pairs[0] if len(pairs) == 1 else None
         self.rep.info("nr15_roots", "validated complete ROM candidate arrays and their profile root table",
                       bank_va=hex(self.cap.bank_va), profile_table=hex(self.profile_table),
+                      default_bb_rom_offset=hex(self.bb_default_off),
+                      bw_pair_tables_rom_offset=None if self.pair_table_off is None else hex(self.pair_table_off),
                       arrays={str(p): {"rom_offset": hex(o), "rows": len(rows)}
                               for p, (o, rows) in self.arrays.items()},
                       copy_regions=[{"source": hex(r.source), "destination": hex(r.destination),
                                      "bytes": r.length, "instruction": hex(r.instruction)} for r in self.regions])
         self.support = {}
+        # Optional runtime policy, e.g. a PLMN NR bandwidth override:
+        # {(band, scs_index): max_code or None (band/SCS removed)}.
+        self.bw_overrides = {}
+
+    def array_aliases(self, off):
+        """Runtime aliases for initialized ROM objects, not DRDI bank pointers."""
+        aliases = {0x90000000 + off}
+        for region in self.regions:
+            if region.source <= off < region.source + region.length:
+                runtime = region.destination + off - region.source
+                aliases.update((runtime, (runtime & 0x1FFFFFFF) | 0x80000000,
+                                ((runtime & 0x1FFFFFFF) | 0x80000000) - 0x70000000))
+        return aliases
+
+    def pcrel_refs(self, off):
+        """Corroborate ROM data through nanoMIPS ADDIUPC consumers."""
+        if not hasattr(self, "_pcrel_index"):
+            self._pcrel_index = {}
+            np = self.u.np
+            if np is not None:
+                hs = np.frombuffer(self.rom,dtype="<u2",count=len(self.rom)//2)
+                ix = np.flatnonzero((hs[:-2] & 0xFC1F) == 0x6003)
+                target = ((ix.astype("int64")*2 + 6 + hs[ix+1].astype("int64")
+                           + (hs[ix+2].view("<i2").astype("int64") << 16)) & 0xFFFFFFFF)
+                for index, value in zip(ix,target):
+                    self._pcrel_index.setdefault(int(value),[]).append(int(index)*2)
+            else:
+                for ref in range(0,len(self.rom)-5,2):
+                    h,lo,hi = struct.unpack_from("<HHh",self.rom,ref)
+                    if h & 0xFC1F == 0x6003:
+                        value = (ref+6+lo+(hi << 16)) & 0xFFFFFFFF
+                        self._pcrel_index.setdefault(value,[]).append(ref)
+        # Direct ROM references normalize to file offsets; initialized RAM
+        # references normalize to the destination aliases of their copy region.
+        aliases = self.array_aliases(off) | {off}
+        return sorted({ref for value in aliases for ref in self._pcrel_index.get(value,())})
+
+    def profile_tables(self, images, options):
+        """Select complete per-profile arrays via one ordered firmware root vector.
+
+        Identical ROM copies can all parse in a reused DRDI runtime window.
+        Structural validity does not select the copy: the root vector does.
+        The BB-root group and ADDIUPC consumers corroborate the surrounding
+        block; conflicting complete vectors remain an error.
+        """
+        if [im.profile for im in images] != list(range(len(images))):
+            return []
+        first_refs = set()
+        for off in options[images[0].profile]:
+            for value in self.array_aliases(off):
+                first_refs.update(ref for ref in self.u.find_all(self.rom,struct.pack("<I",value))
+                                  if ref % 4 == 0)
+        found = []
+        span = 4*len(images)
+        for root in sorted(first_refs):
+            if root < 3*span or root+2*span > len(self.rom):
+                continue
+            arrays = []
+            for im in images:
+                off = self.resolve_rom(self.u.u32(self.rom,root+4*im.profile),4)
+                if off not in options[im.profile]:
+                    break
+                bb = self.resolve_rom(self.u.u32(self.rom,root-3*span+4*im.profile),2)
+                if bb is None or band_bw_pairs(self.rom,bb,len(self.loader.tables.bw)) is None:
+                    break
+                arrays.append((off,options[im.profile][off]))
+            if len(arrays) != len(images):
+                continue
+            # The selector and following supported-NR root group are consumed
+            # by the linkage setter; BB roots are consumed by the BW setter.
+            if not all(self.pcrel_refs(off) for off in (root,root+span,root-3*span)):
+                continue
+            found.append((root,arrays))
+        return found
+
+    def discover_rf_limits(self):
+        """Find the enum-associated RF band list and its consuming pointer.
+
+        NR15 variants have different intervening header words. A fixed +4
+        incorrectly lands on the MT6877 header, not the band list.
+        """
+        start = self.loader.tables.bw_off + 4*(len(self.loader.tables.bw)+1)
+        found = []
+        for off in range(start+4,min(start+24,len(self.rom)-1),2):
+            limits = band_bw_pairs(self.rom,off,len(self.loader.tables.bw))
+            if limits is not None and self.pcrel_refs(off):
+                found.append((off,limits))
+        if len(found) != 1:
+            raise self.u.UniversalError("NR15: RF per-band bandwidth list lacks a unique consuming pointer")
+        return found[0]
+
+    def discover_default_bb(self):
+        """Find NL1_RFD_Drdi_Set_BW_Data's default-branch per-band BB table.
+
+        The setter selects the profile BB roots only when a customization flag
+        is 1, otherwise it loads two ROM constants (single-band bitmask DB,
+        then per-band BB DB) with ADDIUPC right after the profile-root loads.
+        On both audited NR15 images that flag is BSS with a reader and no
+        direct store, and the MT6877 capture matches the default table.
+        """
+        span = 4*self.profile_count
+        found = set()
+        for ref in self.pcrel_refs(self.profile_table - 3*span):
+            for off in range(ref + 6, min(ref + 64, len(self.rom) - 5), 2):
+                for reg in range(32):
+                    target = pcrel48(self.rom, off, reg)
+                    if (target is not None and target < len(self.rom)
+                            and band_bw_pairs(self.rom, target, len(self.loader.tables.bw)) is not None):
+                        found.add(target)
+        if len(found) != 1:
+            raise self.u.UniversalError("NR15: default per-band BB bandwidth table is not uniquely referenced")
+        off = found.pop()
+        return off, band_bw_pairs(self.rom, off, len(self.loader.tables.bw))
 
     def resolve_rom(self, va, size=1):
         if not 0 < va <= 0xFFFFFFFF or size < 0:
@@ -370,7 +495,7 @@ class Nr15Decoder:
             return self.support
         nr = {}
         for im in self.cap.images:
-            root_ref = self.profile_table + 12 + 4*im.profile
+            root_ref = self.profile_table + 4*self.profile_count + 4*im.profile
             ptr = self.u.u32(self.rom, root_ref)
             off = self.resolve_rom(ptr, 4)
             if off is None:
@@ -452,18 +577,30 @@ class Nr15Decoder:
                 "complete_namespace": "stored primary candidate and LTE root arrays, not all runtime capabilities",
                 "candidate_profile_table_rom_offset": hex(self.profile_table),
                 "lte_profile_table_rom_offset": hex(self.lte_profile_table),
-                "bandwidth_source": "minimum RF and profile-specific BB per-band limits",
-                "bb_customization_activation": "assumed active for the static profile projection; runtime flag not verified",
+                "bandwidth_source": "minimum of RF and default-branch BB per-band limits",
+                "bb_customization_activation": ("inactive: the setter's flag is zero-initialized with no direct "
+                                                "store; profile BB tables are reported but not applied"),
+                "default_bb_rom_offset": hex(self.bb_default_off),
+                "rf_bandwidth_rom_offset": hex(self.rf_limits_off),
+                "bw_pair_tables_rom_offset": None if self.pair_table_off is None else hex(self.pair_table_off),
+                "bw_pair_policy": {"inter_band_mode": BW_MODE_INTER, "intra_band_mode": BW_MODE_INTRA,
+                                   "meaning": "120 MHz two-carrier policy (hardware state <=1, SBP 0x4E not default)"},
+                "scs_rules": {"scs15_max_mhz": self.loader.tables.bw[SCS15_MAX_CODE],
+                              "dl_budget": f"sum(MHz * 30/SCS) <= {DL_SCS_BUDGET}"},
                 "rf_bandwidth_mhz": {str(b): self.loader.tables.bw[c] for b, c in self.rf_limits.items()},
+                "default_bb_bandwidth_mhz": {str(b): self.loader.tables.bw[c] for b, c in self.bb_default.items()},
                 "profile_bb_bandwidth_mhz": {str(p): {str(b): self.loader.tables.bw[c]
                                                       for b, c in limits.items()}
                                              for p, limits in self.band_limits.items()},
                 "max_stored_nr_cc": max(row.nr.units for _, rows in self.arrays.values() for row in rows),
-                "validated_projection": "single-carrier NR; 15/30 kHz SCS alternatives",
+                "validated_projection": ("one- and two-carrier NR (NR-CA and EN-DC), per-CC bandwidth pairs and "
+                                         "15/30 kHz SCS; exact against a Redmi Note 12 Pro capture"),
                 "limitations": ["Static profile projection, not a captured runtime capability.",
-                                "Uses profile BB customization; runtime overrides/SBP/SIM filters are not applied.",
+                                "Two-carrier policy fixed to the 120 MHz branch; the SBP default branch is 100 MHz.",
+                                "PLMN NR bandwidth overrides, SIM band/SCS exclusions and SBP MIMO downgrades "
+                                "are not applied.",
                                 "Supplementary-uplink (SUL) combinations are not reconstructed.",
-                                "Multi-carrier NR bandwidth materialization is not yet validated and is rejected."]}
+                                "More than two NR carriers is not validated and is rejected."]}
 
     def decode(self, im, candidates):
         u, tables = self.u, self.loader.tables
@@ -477,29 +614,87 @@ class Nr15Decoder:
                     lte.append(u.export.LteComponent(band, dl, ul,
                                [u.DL_MIMO[x[1]] for x in cand.lte.fsc[cur:cur+n]]))
                     cur += n
-            nd = cand.nr
-            # The NR15 materializer expands SCS alternatives explicitly.
-            # A 15 kHz carrier is capped at enum 7 (50 MHz). Band maxima
-            # come from the RF/BB tables, not a duplex-mode guess.
-            if nd.units != 1:
-                raise u.UniversalError("NR15 multi-carrier bandwidth materialization has not been validated")
-            band, ul, dl = nd.records[0]
-            if band not in self.rf_limits or band not in self.band_limits[im.profile]:
-                raise u.UniversalError(f"NR15: n{band} has no validated RF/BB bandwidth limit")
-            code = min(self.rf_limits[band], self.band_limits[im.profile][band])
-            if code > 10:
-                raise u.UniversalError("NR15 single-carrier bandwidth above 100 MHz is not validated")
-            um, dm = nd.fsc[0]
-            absent = ul in tables.nr_ul_absent
-            if absent != (um == 3):
-                raise u.UniversalError("NR15 UL class/MIMO closure failed")
-            for scs in (0, 1):
-                bw = tables.bw[min(code, 7)] if scs == 0 else tables.bw[code]
-                cc = u.export.NrCC(u.SCS[scs], u.DL_MIMO[dm], bw,
-                                   None if absent else u.UL_MIMO[um], None if absent else bw)
-                nr = u.export.NrComponent(band, dl, u.NR_UL_ABSENT_CANON if absent else ul, [cc])
-                out.append(u.export.Combo(lte, [nr]))
+            out.extend(self.nr_variants(lte, cand.nr))
         return u.dedup_exact(out)
+
+    def nr_limits(self, records):
+        """Per-record ceilings exactly as nl1_rfd_cap_bw_info derives them.
+
+        min(RF, BB) for the first two NR records. Like the firmware, a band
+        missing from the BB table keeps the previous record's ceiling.
+        """
+        limits, ceiling = [], len(self.loader.tables.bw)
+        for band, _, _ in records[:2]:
+            if band not in self.rf_limits:
+                raise self.u.UniversalError(f"NR15: n{band} has no validated RF bandwidth limit")
+            if band in self.bb_default:
+                ceiling = min(self.rf_limits[band], self.bb_default[band])
+            if ceiling == len(self.loader.tables.bw):
+                ceiling = self.rf_limits[band]
+            limits.append(ceiling)
+        if any(code > 10 for code in limits):
+            raise self.u.UniversalError("NR15 carrier bandwidth above 100 MHz is not validated")
+        return limits
+
+    def nr_variants(self, lte, nd):
+        """Bandwidth pairs, then per-CC SCS expansion and the DL budget gate.
+
+        Mirrors nl1_rfd_cap_fill_in_ca_comb_info and nl1_cap_arrange_by_sim_type:
+        the pair function runs on all-15-kHz copies, each pair then gains every
+        other per-CC SCS assignment in firmware order. Runtime-only filters
+        (PLMN bandwidth overrides, SIM band/SCS exclusions) are not applied.
+        """
+        u, tables = self.u, self.loader.tables
+        records = nd.records
+        if len(records) > 2 or nd.units > 2:
+            raise u.UniversalError("NR15: more than two NR carriers is not validated")
+        limits = self.nr_limits(records)
+        if nd.units == 1:
+            pairs = [tuple(limits)]
+        else:
+            if self.pair_table_off is None:
+                raise u.UniversalError("NR15: firmware bandwidth-pair tables were not found uniquely")
+            mode = BW_MODE_INTER if len(records) == 2 else BW_MODE_INTRA
+            pairs = mtk_nr15_bw.bandwidth_pairs(limits, mode, tables.bw)
+        shapes = []
+        for pair in pairs:
+            ccs, cur = [], 0
+            for index, (band, ul, dl) in enumerate(records):
+                uplinks = 0 if ul in tables.nr_ul_absent else tables.nr_weights[ul]
+                for k in range(tables.nr_weights[dl]):
+                    um, dm = nd.fsc[cur + k]
+                    if (k >= uplinks) != (um == 3):
+                        raise u.UniversalError("NR15 UL class/MIMO closure failed")
+                    # Inter-band pairs are per record, intra-band pairs per CC.
+                    code = pair[index] if len(records) == 2 else pair[k]
+                    ccs.append((index, code, dm, None if k >= uplinks else um))
+                cur += tables.nr_weights[dl]
+            shapes.append(ccs)
+        ordered = [(ccs, (0,)*nd.units) for ccs in shapes]
+        ordered += [(ccs, scs) for ccs in shapes
+                    for scs in itertools.product((0, 1), repeat=nd.units) if any(scs)]
+        out = []
+        for ccs, assignment in ordered:
+            total, per_record = 0, [[] for _ in records]
+            for (index, code, dm, um), scs in zip(ccs, assignment):
+                override = self.bw_overrides.get((records[index][0], scs), code)
+                if override is None:
+                    break
+                code = min(code, override)
+                if scs == 0:
+                    code = min(code, SCS15_MAX_CODE)
+                bw = tables.bw[code]
+                total += bw * (2 if scs == 0 else 1)
+                per_record[index].append(u.export.NrCC(u.SCS[scs], u.DL_MIMO[dm], bw,
+                                         None if um is None else u.UL_MIMO[um],
+                                         None if um is None else bw))
+            else:
+                if total > DL_SCS_BUDGET:
+                    continue
+                nr = [u.export.NrComponent(band, dl, u.NR_UL_ABSENT_CANON if ul in tables.nr_ul_absent else ul, ccs)
+                      for (band, ul, dl), ccs in zip(records, per_record)]
+                out.append(u.export.Combo(lte, nr))
+        return out
 
     def extract_capability(self, profile):
         u = self.u
