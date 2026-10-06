@@ -73,6 +73,16 @@ BW_FAMILIES = {
     "nr15_13": (5, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100, 200, 400),
 }
 BW20 = BW_FAMILIES["modern20"]
+# Bandwidth dictionary for FeatureObj bw_code, per ROM family. The legacy14
+# list found in md1rom (90 inserted before 100) is NOT the feature-code enum:
+# MD800 feature objects use the 13-entry order shared with NR15 and the
+# modern20 prefix (code 10 = 100 MHz). Proof on RG620T-EG: a captured UE
+# capability advertises n40/n41/n77/n78/n79 at 100 MHz (never 90) where the
+# feature objects carry code 10, while codes 8/9 = 60/80 MHz match the capture;
+# the MD800 absent sentinel 03 0d 01 is "one past a 13-entry enum", the same
+# convention as modern 03 14 01 (one past 20). The legacy14 site is still used
+# to locate the neighbouring class-weight and band-map tables.
+FEATURE_BW = {"legacy14": BW_FAMILIES["nr15_13"]}
 
 LTE_WEIGHT_PREFIX = bytes((1, 2, 2, 3, 4, 5))
 NR_WEIGHT_PREFIX = bytes((1, 2, 2, 3, 4, 2, 3, 4, 5, 6, 7, 8))
@@ -321,7 +331,7 @@ def discover_rom_tables(rom: bytes, rep: Reporter) -> RomTables:
 
         nrw = _read_nr_weights(rom, nr_off)
         ltew = tuple(rom[lte_off:lte_off + 6])
-        bw = tuple(tbl)
+        bw = tuple(FEATURE_BW.get(fam, tbl))
         if len(nrw) < len(NR_WEIGHT_PREFIX) or nrw[:len(NR_WEIGHT_PREFIX)] != tuple(NR_WEIGHT_PREFIX):
             errors.append("%s@%#x: NR weights failed prefix validation: %s" % (fam, bw_off, nrw[:16]))
             continue
