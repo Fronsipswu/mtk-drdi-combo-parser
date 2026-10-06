@@ -104,6 +104,7 @@ class ModemRecord:
     loader: str = "—"
     counts: dict[str, int] = field(default_factory=dict)
     details: dict = field(default_factory=dict)
+    combo_cache: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def key(self) -> str:
@@ -149,7 +150,7 @@ class MtkBackend:
             raise BackendError(str(exc)) from exc
 
     @classmethod
-    def summarize(cls, record: ModemRecord, *, loader: str = "auto") -> dict:
+    def summarize(cls, record: ModemRecord, *, loader: str = "auto", retain_combos: bool = False) -> dict:
         """Decode one imported source to discover its exportable bank/profiles."""
         parts = cls.parts(record.source)
         args = SimpleNamespace(loader=loader, profile="all", out=None,
@@ -162,12 +163,43 @@ class MtkBackend:
                 args, parts.rom, parts.drdi, reporter, drdi_data=parts.drdi_data)
             cap, states, per_profile, union, lte_bank, lte_profiles, lte_union, unresolved = \
                 UNIVERSAL.extract_capability(active, "all", reporter)
+            secondary_combos = {} if retain_combos else None
             secondary_profiles = UNIVERSAL.tensor_secondary_summaries(
                 active, "all", reporter, lte_profiles=lte_profiles,
-                lte_count=len(lte_union))
+                lte_count=len(lte_union), combo_profiles=secondary_combos)
             supported_bands = UNIVERSAL.annotate_band_participation(
                 UNIVERSAL.discover_supported_bands(active, cap, lte_bank, reporter),
                 union, lte_union)
+            if retain_combos:
+                cache = {}
+                physical = isinstance(active, UNIVERSAL.TensorCdfLoader)
+                notes = ["Static firmware capability variants, not a captured or advertised modem log.",
+                         "NRDC is a presentation category for mixed FR1/FR2 NR rows."]
+                notes.extend(dict.fromkeys(issue.message for issue in reporter.issues
+                                           if issue.level in {"warn", "warning", "fail", "error"}))
+                if isinstance(active, UNIVERSAL.Nr15Loader):
+                    projection = active.decoder.projection_info()
+                    notes.extend(projection["limitations"])
+                    notes.append("BB customization: " + projection["bb_customization_activation"])
+                for p, combos in per_profile.items():
+                    lte_rows = (active.lte_rows_by_bank.get(cap.table_index, {}).get(p, ())
+                                if physical else lte_profiles.get(p, ()))
+                    cache[(cap.table_index, p)] = {
+                        "nr": tuple(combos), "lte": tuple(UNIVERSAL.dedup_exact(lte_rows)),
+                        "loader": active.name, "lte_bank_index": cap.table_index if physical
+                        else lte_bank.table_index if lte_bank else None,
+                        "notes": tuple(notes + (["This profile's NR features could not be fully resolved."]
+                                                if p in unresolved else []))}
+                for (bank, p), combos in (secondary_combos or {}).items():
+                    cache[(bank, p)] = {"nr": tuple(combos), "lte": (), "loader": active.name,
+                                       "lte_bank_index": bank, "notes": tuple(notes)}
+                if physical:
+                    for bank, profiles in active.lte_rows_by_bank.items():
+                        for p, rows in profiles.items():
+                            entry = cache.setdefault((bank, p), {"nr": (), "loader": active.name,
+                                                   "lte_bank_index": bank, "notes": tuple(notes)})
+                            entry["lte"] = tuple(UNIVERSAL.dedup_exact(rows))
+                record.combo_cache = cache
         except Exception as exc:
             raise BackendError(str(exc)) from exc
         return {
@@ -206,7 +238,7 @@ class MtkBackend:
                 capability_bank=summary["capability_bank"], lte_bank_index=summary["lte_bank_index"],
                 profile=number, loader=summary["loader"], status="Ready to export",
                 counts={"lte": summary["lte_profiles"].get(str(number), 0),
-                        "endc": kinds.get("endc", 0), "nrca": kinds.get("nrca", 0),
+                        "endc": kinds.get("endc", 0), "nr_sa": kinds.get("nr_sa", 0), "nrca": kinds.get("nrca", 0),
                         "nrdc": kinds.get("nrdc", 0)},
                 details={**source_record.details, "summary": summary},
             ))
@@ -226,7 +258,7 @@ class MtkBackend:
                 lte_bank_index=summary.get("lte_bank_index"), profile=number,
                 loader=summary["loader"], status="Ready to export",
                 counts={"lte": int(profile.get("lte_count", 0)),
-                        "endc": kinds.get("endc", 0), "nrca": kinds.get("nrca", 0),
+                        "endc": kinds.get("endc", 0), "nr_sa": kinds.get("nr_sa", 0), "nrca": kinds.get("nrca", 0),
                         "nrdc": kinds.get("nrdc", 0)},
                 details={**source_record.details, "summary": summary,
                          "secondary_bank": int(profile.get("bank_index", 8))},
@@ -257,6 +289,8 @@ class MtkBackend:
             records.sort(key=lambda r: (r.capability_bank_index, r.profile))
         if not records:
             raise BackendError("no validated capability profiles were discovered")
+        for record in records:
+            record.combo_cache = source_record.combo_cache
         return records
 
     @classmethod
@@ -421,10 +455,10 @@ def format_profile_topology(report: dict) -> str:
     for profile in report.get("profiles", ()):
         kinds = profile.get("gui_counts", profile.get("kinds", {}))
         lines.append("  profile {profile}: {rows} NR/EN-DC rows "
-                     "(EN-DC {endc}, NR-CA {nrca}, NRDC {nrdc}); LTE table rows {lte}".format(
+                     "(EN-DC {endc}, NR SA {nr_sa}, NR-CA {nrca}, NRDC {nrdc}); LTE table rows {lte}".format(
                          profile=profile.get("profile", "?"),
                          rows=profile.get("decoded_rows", 0),
-                         endc=kinds.get("endc", 0), nrca=kinds.get("nrca", 0),
+                         endc=kinds.get("endc", 0), nr_sa=kinds.get("nr_sa", 0), nrca=kinds.get("nrca", 0),
                          nrdc=kinds.get("nrdc", 0),
                          lte=(report["physical_lte_profiles"].get(str(cap_index), {}).get(str(profile.get("profile")), 0)
                               if report.get("physical_lte_profiles") is not None
@@ -456,11 +490,11 @@ def format_profile_topology(report: dict) -> str:
         for profile in secondary:
             kinds = profile.get("gui_counts", profile.get("kinds", {}))
             lines.append("  bank {bank} / profile {profile}: {rows} rows "
-                         "(EN-DC {endc}, NR-CA {nrca}, NRDC {nrdc})".format(
+                         "(EN-DC {endc}, NR SA {nr_sa}, NR-CA {nrca}, NRDC {nrdc})".format(
                              bank=profile.get("bank_index", "?"),
                              profile=profile.get("profile", "?"),
                              rows=profile.get("decoded_rows", 0),
-                             endc=kinds.get("endc", 0), nrca=kinds.get("nrca", 0),
+                             endc=kinds.get("endc", 0), nr_sa=kinds.get("nr_sa", 0), nrca=kinds.get("nrca", 0),
                              nrdc=kinds.get("nrdc", 0)))
     return "\n".join(lines)
 
@@ -468,9 +502,9 @@ def format_profile_topology(report: dict) -> str:
 def selected_count_summary(records: Iterable[ModemRecord]) -> str:
     selected = [record for record in records if record.selected]
     totals = {key: sum(record.counts.get(key, 0) for record in selected)
-              for key in ("lte", "endc", "nrca", "nrdc")}
+              for key in ("lte", "endc", "nr_sa", "nrca", "nrdc")}
     return (f"{len(selected)} selected — row sums (overlap included): LTE {totals['lte']:,}; "
-            f"EN-DC {totals['endc']:,}; NR-CA {totals['nrca']:,}; NRDC {totals['nrdc']:,}")
+            f"EN-DC {totals['endc']:,}; NR SA {totals['nr_sa']:,}; NR-CA {totals['nrca']:,}; NRDC {totals['nrdc']:,}")
 
 
 class MtkParserGUI:
@@ -492,8 +526,9 @@ class MtkParserGUI:
 
         self.records: list[ModemRecord] = []
         self.visible: dict[str, ModemRecord] = {}
+        self.viewers: dict[tuple, Any] = {}
         self.busy = False
-        self.status_var = tk.StringVar(value="Import a packaged modem image or extracted-parts directory.")
+        self.status_var = tk.StringVar(value="Import a modem image or parts directory; double-click a profile to view combinations.")
         self.loader_var = tk.StringVar(value="auto")
         self.format_vars = {name: tk.BooleanVar(value=name != "cap_prune") for name in EXPORT_FORMATS}
         self.exclude_mimo_subsets_var = tk.BooleanVar(value=False)
@@ -521,20 +556,20 @@ class MtkParserGUI:
         self.import_folder_button = ttk.Button(top, text="Import parts folder", command=self.choose_folder)
         self.import_folder_button.pack(side="left", padx=(self.s(8), 0))
         ttk.Label(top, text="Container loader").pack(side="left", padx=(self.s(16), self.s(6)))
-        ttk.Combobox(top, textvariable=self.loader_var, values=("auto", "grid", "tensor", "flat"),
+        ttk.Combobox(top, textvariable=self.loader_var, values=("auto", "nr15", "grid", "tensor", "flat"),
                      width=9, state="readonly").pack(side="left")
         self.clear_button = ttk.Button(top, text="Clear imports", state="disabled", command=self.clear)
         self.clear_button.pack(side="right")
 
         tree_frame = ttk.Frame(outer)
         tree_frame.pack(fill="both", expand=True)
-        columns = ("extract", "name", "bank", "profile", "lte", "endc", "nrca", "nrdc", "packaging", "path")
+        columns = ("extract", "name", "bank", "profile", "lte", "endc", "nr_sa", "nrca", "nrdc", "packaging", "path")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
         labels = {"extract": "Run", "name": "Modem source", "bank": "Bank address",
-                  "profile": "Profile", "lte": "LTE", "endc": "EN-DC", "nrca": "NR-CA",
+                  "profile": "Profile", "lte": "LTE", "endc": "EN-DC", "nr_sa": "NR SA", "nrca": "NR-CA",
                   "nrdc": "NRDC", "packaging": "DRDI packaging", "path": "Source path"}
         widths = {"extract": 55, "name": 210, "bank": 120, "profile": 70, "lte": 75,
-                  "endc": 75, "nrca": 75, "nrdc": 75, "packaging": 115, "path": 350}
+                  "endc": 75, "nr_sa": 75, "nrca": 75, "nrdc": 75, "packaging": 115, "path": 350}
         for column in columns:
             self.tree.heading(column, text=labels[column])
             self.tree.column(column, width=self.s(widths[column]), minwidth=self.s(45),
@@ -544,6 +579,8 @@ class MtkParserGUI:
         xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
         self.tree.bind("<Button-1>", self.toggle_checkbox)
+        self.tree.bind("<Double-1>", self.on_double_click)
+        self.tree.bind("<Return>", self.open_selected_viewer)
         self.tree.bind("<space>", self.toggle_selected)
         self.tree.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
@@ -574,6 +611,8 @@ class MtkParserGUI:
         self.deselect_button.pack(side="left")
         self.select_button = ttk.Button(actions, text="Select all", command=self.select_all)
         self.select_button.pack(side="left", padx=(self.s(8), 0))
+        self.view_button = ttk.Button(actions, text="View combos", command=self.open_selected_viewer)
+        self.view_button.pack(side="left", padx=(self.s(8), 0))
         self.compare_button = ttk.Button(actions, text="Compare profiles", command=self.choose_compare)
         self.compare_button.pack(side="right")
         self.topology_button = ttk.Button(actions, text="Profile topology", command=self.show_topology)
@@ -595,7 +634,8 @@ class MtkParserGUI:
         self.busy = busy
         state = "disabled" if busy else "normal"
         for button in (self.import_button, self.select_button, self.deselect_button,
-                       self.import_folder_button, self.compare_button, self.topology_button, self.export_button):
+                       self.import_folder_button, self.compare_button, self.topology_button, self.export_button,
+                       self.view_button):
             button.configure(state=state)
         self.clear_button.configure(state="disabled" if busy or not self.records else "normal")
         self.root.configure(cursor="watch" if busy else "")
@@ -630,7 +670,7 @@ class MtkParserGUI:
             for path in paths:
                 try:
                     source_record = MtkBackend.inspect(path)
-                    summary = MtkBackend.summarize(source_record, loader=loader)
+                    summary = MtkBackend.summarize(source_record, loader=loader, retain_combos=True)
                     good.extend(MtkBackend.profile_records(source_record, summary))
                 except Exception: failed.append((path, traceback.format_exc()))
             self.root.after(0, lambda: self.import_finished(good, failed))
@@ -654,6 +694,10 @@ class MtkParserGUI:
             messagebox.showwarning("Some imports failed", "See the log for details. No source was guessed.")
 
     def clear(self) -> None:
+        for window in list(self.viewers.values()):
+            if window.winfo_exists():
+                window.destroy()
+        self.viewers.clear()
         self.records.clear(); self.visible.clear(); self.refresh()
         self.status_var.set("Imports cleared.")
         self.append_log("Cleared all modem sources.")
@@ -667,7 +711,8 @@ class MtkParserGUI:
             count = record.counts
             self.tree.insert("", "end", iid=iid, values=("☑" if record.selected else "☐", record.display_name,
                              record.capability_bank or "—", record.profile if record.profile is not None else "—",
-                             f"{count.get('lte', 0):,}", f"{count.get('endc', 0):,}", f"{count.get('nrca', 0):,}",
+                             f"{count.get('lte', 0):,}", f"{count.get('endc', 0):,}", f"{count.get('nr_sa', 0):,}",
+                             f"{count.get('nrca', 0):,}",
                              f"{count.get('nrdc', 0):,}", record.packaging, str(record.source)))
         self.clear_button.configure(state="normal" if self.records and not self.busy else "disabled")
 
@@ -687,6 +732,66 @@ class MtkParserGUI:
             if record: record.selected = not record.selected; self.refresh()
         return "break"
 
+    def on_double_click(self, event: Any) -> str | None:
+        if self.busy:
+            return "break"
+        column = self.tree.identify_column(event.x)
+        if self.tree.identify_region(event.x, event.y) not in {"cell", "tree"}:
+            return None
+        if column == "#1":
+            return "break"
+        iid = self.tree.identify_row(event.y)
+        record = self.visible.get(iid)
+        if record is not None:
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            name = self.tree.column(column, "id")
+            tab = {"lte": "LTE", "endc": "EN-DC", "nr_sa": "NR SA (1CC)",
+                   "nrca": "NR-CA", "nrdc": "NRDC"}.get(name)
+            self.open_viewer_for_record(record, initial_tab=tab)
+            return "break"
+        return None
+
+    def open_selected_viewer(self, _event=None) -> str:
+        from tkinter import messagebox
+        if self.busy:
+            return "break"
+        selection = self.tree.selection()
+        record = self.visible.get(selection[0]) if selection else None
+        if record is None:
+            messagebox.showinfo("View combos", "Select a capability-profile row first.", parent=self.root)
+        else:
+            self.open_viewer_for_record(record)
+        return "break"
+
+    def open_viewer_for_record(self, record: ModemRecord, *, initial_tab: str | None = None) -> None:
+        from tkinter import messagebox
+        from mtk_viewer import ComboViewerWindow
+        key = (record.key, record.capability_bank_index, record.profile)
+        window = self.viewers.get(key)
+        if window is not None and window.winfo_exists():
+            if initial_tab:
+                window.select_family(initial_tab)
+            window.deiconify()
+            window.lift()
+            window.focus_set()
+            return
+        data = record.combo_cache.get((record.capability_bank_index, record.profile))
+        if data is None:
+            messagebox.showwarning("View combos", "Re-import this source to create its in-memory combo snapshot.",
+                                   parent=self.root)
+            return
+        try:
+            window = ComboViewerWindow(self.root, record=record, data=data, scale=self.scale,
+                                       initial_tab=initial_tab)
+        except Exception as exc:
+            self.append_log(f"Could not view {record.display_name}: {exc}")
+            messagebox.showerror("Viewer failed", str(exc), parent=self.root)
+            return
+        self.viewers[key] = window
+        window.bind("<Destroy>", lambda event: self.viewers.pop(key, None)
+                    if event.widget is window else None, add="+")
+
     def select_all(self) -> None:
         for record in self.records: record.selected = True
         self.refresh()
@@ -700,7 +805,7 @@ class MtkParserGUI:
 
     def _settings(self) -> str:
         loader = self.loader_var.get()
-        if loader not in {"auto", "grid", "tensor", "flat"}: raise BackendError("choose a supported loader")
+        if loader not in {"auto", "nr15", "grid", "tensor", "flat"}: raise BackendError("choose a supported loader")
         return loader
 
     def _export_formats(self) -> frozenset[str]:
@@ -814,7 +919,7 @@ def cli_main(argv=None) -> int:
     ap.add_argument("--list", action="store_true", help="inspect the source and print container provenance")
     ap.add_argument("--out", type=Path, help="output directory; runs extraction instead of launching the GUI")
     ap.add_argument("--device", default="MediaTek modem")
-    ap.add_argument("--loader", default="auto", choices=("auto", "grid", "tensor", "flat"))
+    ap.add_argument("--loader", default="auto", choices=("auto", "nr15", "grid", "tensor", "flat"))
     ap.add_argument("--profile", default="all")
     ap.add_argument("--formats", default=",".join(EXPORT_FORMATS),
                     help="comma-separated: b0cd,b826,mtk_nr,mtk_lte,cap_prune")

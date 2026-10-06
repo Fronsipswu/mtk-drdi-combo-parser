@@ -56,13 +56,12 @@ from mtk_export import write_b0cd_v41
 from mtk_tensor_secondary import decode_tensor_secondary
 from mtk_trace import write_trace
 
-VERSION = "0.4-universal"
+VERSION = "0.5-universal"
 
 U32 = struct.Struct("<I")
 D16 = struct.Struct("<IIII")
 NRREC = struct.Struct("<HBB")
-# Two bandwidth-enum families are proven in the corpus.  They are disjoint at
-# index 10 (100 vs 90), so a hit is never ambiguous.  A third family must be
+# Bandwidth-enum families proven in the corpus. New families must be
 # added here explicitly -- the tool refuses to extrapolate an enum it has not
 # seen, because a wrong bandwidth dictionary produces plausible-looking but
 # wrong output, which is the exact failure mode this project treats as worst.
@@ -71,6 +70,7 @@ BW_FAMILIES = {
                  100, 200, 400, 35, 45, 70, 90, 800, 1600, 2000),
     "legacy14": (5, 10, 15, 20, 25, 30, 40, 50, 60, 80,
                  90, 100, 200, 400),
+    "nr15_13": (5, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100, 200, 400),
 }
 BW20 = BW_FAMILIES["modern20"]
 
@@ -215,6 +215,14 @@ def _bw_sites(rom: bytes) -> list:
                 if o + len(pat) + 2 > len(rom) or u16(rom, o + len(pat)) != 0:
                     continue
             out.append((fam, o, tbl))
+    if not out:
+        # NR15 stores {u8 enum, u8 pad, u16 MHz}, including an enum-13
+        # terminator. Its unrelated 15-entry RF-frequency table is NOT the
+        # NR feature enum (indices 9 and 10 have different meanings).
+        tbl = BW_FAMILIES["nr15_13"]
+        pat = b"".join(struct.pack("<BBH", i, 0, bw) for i, bw in enumerate(tbl))
+        pat += struct.pack("<BBH", len(tbl), 0, 0)
+        out.extend(("nr15_13", o, tbl) for o in find_all(rom, pat))
     return out
 
 
@@ -529,6 +537,8 @@ def discover_supported_band_list(loader: BaseLoader, bank: Optional[Bank],
 def discover_supported_bands(loader: BaseLoader, cap: Bank,
                              lte_bank: Optional[Bank], rep: Reporter) -> dict:
     """Return standalone LTE/NR support separately from combination rows."""
+    if isinstance(loader, Nr15Loader):
+        return loader.decoder.supported_bands()
     out = {}
     lte = discover_supported_band_list(loader, lte_bank, "LTE", rep)
     nr = discover_supported_band_list(loader, cap, "NR", rep)
@@ -672,7 +682,7 @@ class GridLoader(BaseLoader):
                 images.append(Image(va, pi, src, ln, va - src, self.drdi,
                                     label=f"bank{bi}/profile{pi}"))
             self.banks.append(Bank(va, images, bi))
-        self.rep.info("grid_loader", "discovered modern bank/profile descriptor matrix",
+        self.rep.info("grid_loader", "discovered bank/profile descriptor matrix",
                       descriptor_table_off=hex(self.descriptor_table_off), columns=self.columns,
                       banks=len(self.banks), live_counts=[len(b.images) for b in self.banks])
 
@@ -707,6 +717,57 @@ class GridLoader(BaseLoader):
             self.rep.info("capability_bank_rejected", "bank has no validated CandidateNode array",
                           bank_va=hex(b.bank_va), sentinel_hits=sent)
         raise UniversalError("no live grid bank contains a structurally valid CandidateNode array")
+
+
+class Nr15Loader(BaseLoader):
+    """Older plain-offset grids with ROM roots and NR15 MIMO descriptors."""
+    name = "nr15"
+
+    @staticmethod
+    def probe(rom: bytes, drdi: bytes) -> bool:
+        from mtk_nr15 import header_geometry
+        try:
+            header_geometry(rom, drdi)
+        except ValueError:
+            return False
+        values = BW_FAMILIES["nr15_13"]
+        pattern = b"".join(struct.pack("<BBH", i, 0, bw) for i, bw in enumerate(values))
+        pattern += struct.pack("<BBH", len(values), 0, 0)
+        return pattern in rom
+
+    def __init__(self, rom: bytes, drdi: bytes, rep: Reporter):
+        import mtk_nr15
+        super().__init__(rom, drdi, rep)
+        if self.tables.bw_family != "nr15_13":
+            raise UniversalError("NR15 loader requires the indexed 13-entry bandwidth enum")
+        try:
+            _, source = mtk_nr15.header_geometry(rom, drdi)
+        except ValueError as e:
+            raise UniversalError(str(e)) from e
+        hits = []
+        if np is not None:
+            words = np.frombuffer(rom, dtype="<u4", count=len(rom)//4)
+            sf, va, ln = words[:-2].astype("<u8"), words[1:-1], words[2:]
+            mask = ((sf >= source) & (sf + ln <= source + len(drdi))
+                    & (ln >= 0x10) & (ln <= 0x800000) & (va >= VA_LO) & (va < VA_HI))
+            hits = [(int(i)*4, int(sf[i])-source, int(va[i]), int(ln[i]))
+                    for i in np.flatnonzero(mask)]
+        else:
+            for off in range(0, len(rom)-11, 4):
+                sf, va, ln = struct.unpack_from("<III", rom, off)
+                if (source <= sf and sf + ln <= source + len(drdi)
+                        and 0x10 <= ln <= 0x800000 and VA_LO <= va < VA_HI):
+                    hits.append((off, sf-source, va, ln))
+        GridLoader._discover(self, hits)
+        self.decoder = mtk_nr15.Nr15Decoder(sys.modules[__name__], self)
+        rep.info("nr15_loader", "validated CHECK_HEADER-relative grid and older NR grammar",
+                 source_offset=hex(source), descriptor_table_off=hex(self.descriptor_table_off))
+
+    def capability_bank(self):
+        return self.decoder.cap
+
+    def lte_tables(self, cap, rep):
+        return self.decoder.lte_tables()
 
 
 class TensorCdfLoader(BaseLoader):
@@ -1913,6 +1974,8 @@ def choose_lte_bank(loader:BaseLoader, cap:Bank, rep:Reporter):
 
 
 def extract_capability(loader:BaseLoader, profile_arg:str, rep:Reporter):
+    if isinstance(loader, Nr15Loader):
+        return loader.decoder.extract_capability(profile_arg)
     cap=loader.capability_bank(); parser=GrammarParser(loader,rep); fr=FeatureResolver(parser)
     states=[]
     for im in cap.images:
@@ -1942,15 +2005,17 @@ def extract_capability(loader:BaseLoader, profile_arg:str, rep:Reporter):
 
 
 def gui_family_counts(combos):
-    """Separate mixed FR1/FR2 NR-only rows for the GUI's NRDC column.
+    """Separate single-carrier NR and mixed FR1/FR2 rows in the GUI.
 
     This is a band-based presentation classification, not proof of a separate
-    firmware RF_NRDC namespace. Keep the existing export classification intact.
+    firmware RF_NRDC namespace. A one-carrier NR row is not NR-CA.
+    Keep the existing export classification intact.
     """
     endc, nr, lte = export.classify(combos, 1)
     nrdc = sum(any(c.band < 257 for c in row.nr)
                and any(c.band >= 257 for c in row.nr) for row in nr)
-    return {"endc": len(endc), "nrca": len(nr) - nrdc,
+    nr_sa = sum(row.nr_physical_ccs == 1 for row in nr)
+    return {"endc": len(endc), "nr_sa": nr_sa, "nrca": len(nr) - nrdc - nr_sa,
             "nrdc": nrdc, "lte": len(lte)}
 
 
@@ -2001,7 +2066,7 @@ def tensor_related_lte(loader: BaseLoader, secondary_profile: int,
 
 def tensor_secondary_summaries(loader: BaseLoader, profile_arg: str, rep: Reporter,
                                *, lte_profiles: dict[int, list[export.Combo]] | None = None,
-                               lte_count: int = 0):
+                               lte_count: int = 0, combo_profiles: dict | None = None):
     """Decode optional Tensor bank-8 profiles for GUI rows/reporting."""
     if not isinstance(loader, TensorCdfLoader):
         return []
@@ -2011,6 +2076,8 @@ def tensor_secondary_summaries(loader: BaseLoader, profile_arg: str, rep: Report
         if profile_arg != "all" and item.profile != int(profile_arg):
             continue
         combos = _secondary_combos(item)
+        if combo_profiles is not None:
+            combo_profiles[(item.bank_index, item.profile)] = combos
         counts = gui_family_counts(combos)
         related_lte = (tensor_related_lte(loader, item.profile, lte_profiles)
                        if lte_profiles is not None else ())
@@ -2237,6 +2304,8 @@ def run_secondary_extraction(loader: BaseLoader, args, rep: Reporter) -> dict:
 
 
 def run_extraction(loader: BaseLoader, args, rep: Reporter) -> dict:
+    if isinstance(loader, Nr15Loader) and getattr(args, "bank_only", False):
+        raise UniversalError("NR15 bank-only extraction is not implemented; select a capability profile")
     """One extraction path for every container; the loader supplies geometry."""
     if getattr(args, "bank_only", False):
         return run_bank_extraction(loader, args, rep)
@@ -2285,6 +2354,8 @@ def run_extraction(loader: BaseLoader, args, rep: Reporter) -> dict:
              for k, v in f.items()} for f in loader.discovery]
         detail["rom_profile_table"] = (hex(loader.rom_profile_table_off)
                                        if loader.rom_profile_table_off else None)
+    if isinstance(loader, Nr15Loader):
+        detail["nr15"] = loader.decoder.projection_info()
     return detail
 
 
@@ -2359,6 +2430,17 @@ def select_loader(args, rom: bytes, hdr_or_drdi: bytes, rep: Reporter, *, drdi_d
         return TensorCdfLoader(rom, hdr_or_drdi, data, rep), attempts, data
 
     drdi = hdr_or_drdi
+    if want == "nr15" or (want == "auto" and
+                          (Nr15Loader.probe(rom, drdi) or b"MOLY.NR15." in rom)):
+        try:
+            loader = Nr15Loader(rom, drdi, rep)
+            attempts.append({"loader": "nr15", "accepted": True,
+                             "evidence": "CHECK_HEADER geometry, indexed BW enum, complete ROM profile roots"})
+            return loader, attempts, None
+        except UniversalError as e:
+            attempts.append({"loader": "nr15", "accepted": False, "reason": str(e)})
+            if want == "nr15":
+                raise
     if want in ("auto", "grid"):
         hits = GridLoader.descriptor_hits(rom, drdi)
         score = GridLoader._dense_score(hits)
@@ -2407,7 +2489,7 @@ def main(argv=None):
     ap.add_argument("--drdi-data", type=Path, help="Tensor split CDF data file (with --drdi pointing to header)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--profile", default="all", help="profile number or all")
-    ap.add_argument("--loader", default="auto", choices=["auto", "grid", "tensor", "flat"])
+    ap.add_argument("--loader", default="auto", choices=["auto", "nr15", "grid", "tensor", "flat"])
     ap.add_argument("--device", default="MediaTek modem")
     ap.add_argument("--stem", default="mtk")
     args = ap.parse_args(argv)
