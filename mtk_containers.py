@@ -2,7 +2,7 @@
 
 Public API: unwrap_path(path, limits=Limits()) or unwrap_bytes(data, name=...).
 Returns ModemParts with rom, drdi, optional drdi_data and a JSON-safe report.
-Recognizes MTK partition headers, HBLR, extent-based ext4, Android sparse,
+Recognizes MTK partition headers, FBPK, HBLR, extent-based ext4, Android sparse,
 single-stream gzip/xz, and directories of extracted parts. No mounts, external
 programs, temporary files, or filename-specific device dispatch are used.
 """
@@ -18,6 +18,9 @@ import zlib
 
 MTK_MAGIC = b"\x88\x16\x88\x58"
 MTK_HEADER = struct.Struct("<II32s10I")
+FBPK_MAGIC = b"FBPK"
+FBPK_HEADER = struct.Struct("<4sI64sIII")
+FBPK_ENTRY = struct.Struct("<I36sQII")
 SPARSE_MAGIC = b"\x3a\xff\x26\xed"
 ROLES = ("md1rom", "md1drdi", "md1drdi_hdr", "md1drdi_data")
 ROLE_RE = re.compile(r"(?:^|[_\-.])(md1drdi_hdr|md1drdi_data|md1drdi|md1rom)(?=$|[.\-_])", re.I)
@@ -66,6 +69,7 @@ def _kind(data):
     if data.startswith(SPARSE_MAGIC): return "android-sparse"
     if data.startswith(b"\x1f\x8b"): return "gzip"
     if data.startswith(b"\xfd7zXZ\x00"): return "xz"
+    if data.startswith(FBPK_MAGIC): return "fbpk"
     if data.startswith(b"HBLR"): return "hblr"
     if len(data) >= 1082 and data[1080:1082] == b"\x53\xef": return "ext4"
     if data.startswith(MTK_MAGIC): return "mtk"
@@ -313,6 +317,50 @@ class _Unwrapper:
         if checksum and checksum != crc: raise UnwrapError("Android sparse image CRC32 mismatch")
         return bytes(out)
 
+    def fbpk(self, data):
+        layer = self.report["layers"][-1]
+        layer["members"] = []
+        if len(data) < FBPK_HEADER.size:
+            raise UnwrapError("truncated FBPK header")
+        _, version, _, _, count, total_size = FBPK_HEADER.unpack_from(data, 0)
+        if version != 1:
+            raise UnwrapError(f"unsupported FBPK version {version}")
+        if total_size < FBPK_HEADER.size or total_size > len(data):
+            raise UnwrapError("FBPK declared size outside container")
+        if not 1 <= count <= 128:
+            raise UnwrapError("invalid FBPK entry count")
+        pos = FBPK_HEADER.size
+        spans, records = [], []
+        for index in range(count):
+            self.entry()
+            if pos + FBPK_ENTRY.size > total_size:
+                raise UnwrapError("truncated FBPK entry header")
+            entry_type, raw_name, size, next_offset, crc = FBPK_ENTRY.unpack_from(data, pos)
+            name = raw_name.split(b"\0", 1)[0].decode("ascii")
+            payload_off = pos + FBPK_ENTRY.size
+            if not name or payload_off + size > total_size:
+                raise UnwrapError(f"invalid/truncated FBPK entry at {pos:#x}")
+            if index + 1 < count and (next_offset < payload_off + size or next_offset + FBPK_ENTRY.size > total_size):
+                raise UnwrapError(f"invalid FBPK next offset after {name}")
+            spans.append((pos, payload_off + size))
+            records.append((name, entry_type, payload_off, size, crc))
+            layer["members"].append({
+                "name": name,
+                "type": entry_type,
+                "offset": payload_off,
+                "bytes": size,
+            })
+            pos = next_offset
+        spans.sort()
+        if any(b[0] < a[1] for a, b in zip(spans, spans[1:])):
+            raise UnwrapError("overlapping FBPK entries")
+        view = memoryview(data)
+        for name, _entry_type, off, size, crc in records:
+            self.charge(size)
+            if crc and zlib.crc32(view[off:off + size]) != crc:
+                raise UnwrapError(f"FBPK entry CRC32 mismatch: {name}")
+            yield name, data[off:off + size]
+
     def hblr(self, data):
         layer = self.report["layers"][-1]
         layer["members"] = []
@@ -379,6 +427,8 @@ class _Unwrapper:
         self.report["layers"].append({"format": kind, "source": source, "bytes": len(data)})
         if kind in ("gzip", "xz", "android-sparse"):
             self.walk(self.expand(data, kind), source + "!/" + kind, depth + 1)
+        elif kind == "fbpk":
+            self.collect(self.fbpk(data), source, depth)
         elif kind == "hblr":
             self.collect(self.hblr(data), source, depth)
         elif kind == "mtk":
